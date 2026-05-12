@@ -67,52 +67,53 @@ type TXTRegistry struct {
 	// Handle Owner ID migration
 	oldOwnerID string
 
-	// existingTXTs is the TXT records that already exist in the zone so that
-	// ApplyChanges() can skip re-creating them. See the struct below for details.
-	existingTXTs *existingTXTs
+	// existingRecords tracks both TXT ownership records and actual DNS records observed
+	// during Records() to inform ApplyChanges(). See the struct below for details.
+	existingRecords *existingRecords
 }
 
-// existingTXTs stores pre‑existing TXT records to avoid duplicate creation.
+// existingRecords stores pre-existing records observed during Records() to avoid
+// duplicate TXT creation and to detect label changes during ApplyChanges().
 // It relies on the fact that Records() is always called **before** ApplyChanges()
 // within a single reconciliation cycle.
-type existingTXTs struct {
-	entries map[recordKey]struct{}
+type existingRecords struct {
+	entries map[endpoint.EndpointKey]*endpoint.Endpoint
 }
 
-type recordKey struct {
-	dnsName       string
-	setIdentifier string
-}
-
-func newExistingTXTs() *existingTXTs {
-	return &existingTXTs{
-		entries: make(map[recordKey]struct{}),
+func newExistingRecords() *existingRecords {
+	return &existingRecords{
+		entries: make(map[endpoint.EndpointKey]*endpoint.Endpoint),
 	}
 }
 
-func (im *existingTXTs) add(r *endpoint.Endpoint) {
-	key := recordKey{
-		dnsName:       r.DNSName,
-		setIdentifier: r.SetIdentifier,
+func (im *existingRecords) add(r *endpoint.Endpoint) {
+	key := endpoint.EndpointKey{
+		DNSName:       r.DNSName,
+		RecordType:    r.RecordType,
+		SetIdentifier: r.SetIdentifier,
 	}
-	im.entries[key] = struct{}{}
+	im.entries[key] = r
 }
 
-// isAbsent returns true when there is no entry for the given name in the store.
-// This is intended for the "if absent -> create" pattern.
-func (im *existingTXTs) isAbsent(ep *endpoint.Endpoint) bool {
-	key := recordKey{
-		dnsName:       ep.DNSName,
-		setIdentifier: ep.SetIdentifier,
+func (im *existingRecords) get(ep *endpoint.Endpoint) (*endpoint.Endpoint, bool) {
+	key := endpoint.EndpointKey{
+		DNSName:       ep.DNSName,
+		RecordType:    ep.RecordType,
+		SetIdentifier: ep.SetIdentifier,
 	}
-	_, ok := im.entries[key]
+	r, ok := im.entries[key]
+	return r, ok
+}
+
+// isAbsent returns true when there is no entry for the given endpoint.
+// This is intended for the "if absent -> create" pattern used for TXT records.
+func (im *existingRecords) isAbsent(ep *endpoint.Endpoint) bool {
+	_, ok := im.get(ep)
 	return !ok
 }
 
-func (im *existingTXTs) reset() {
-	// Reset the existing TXT records for the next reconciliation loop.
-	// This is necessary because the existing TXT records are only relevant for the current reconciliation cycle.
-	im.entries = make(map[recordKey]struct{})
+func (im *existingRecords) reset() {
+	im.entries = make(map[endpoint.EndpointKey]*endpoint.Endpoint)
 }
 
 // New creates a TXTRegistry from the given configuration.
@@ -164,7 +165,7 @@ func newRegistry(provider provider.Provider, txtPrefix, txtSuffix, ownerID strin
 		txtEncryptEnabled:   txtEncryptEnabled,
 		txtEncryptAESKey:    txtEncryptAESKey,
 		oldOwnerID:          oldOwnerID,
-		existingTXTs:        newExistingTXTs(),
+		existingRecords:     newExistingRecords(),
 	}, nil
 }
 
@@ -182,11 +183,11 @@ func (im *TXTRegistry) OwnerID() string {
 // If TXT records was created previously to indicate ownership its corresponding value
 // will be added to the endpoints Labels map
 func (im *TXTRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
-	// existingTXTs must always hold the latest TXT records, so it needs to be reset every time.
+	// existingRecords must always hold the latest records, so it needs to be reset every time.
 	// Previously, it was reset with a defer after ApplyChanges, but ApplyChanges is not called
 	// when plan.HasChanges() is false (i.e., when there are no changes to apply).
-	// In that case, stale TXT record information could remain, so we reset it here instead.
-	im.existingTXTs.reset()
+	// In that case, stale record information could remain, so we reset it here instead.
+	im.existingRecords.reset()
 
 	// If we have the zones cached AND we have refreshed the cache since the
 	// last given interval, then just use the cached results.
@@ -233,7 +234,7 @@ func (im *TXTRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, error
 		}
 		labelMap[key] = labels
 		txtRecordsMap[record.DNSName] = struct{}{}
-		im.existingTXTs.add(record)
+		im.existingRecords.add(record)
 	}
 
 	for _, ep := range endpoints {
@@ -270,6 +271,7 @@ func (im *TXTRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, error
 		if im.oldOwnerID != "" && ep.Labels[endpoint.OwnerLabelKey] == im.oldOwnerID {
 			ep.Labels[endpoint.OwnerLabelKey] = im.ownerID
 		}
+		im.existingRecords.add(ep)
 
 		// TODO: remove this migration logic in some future release
 		// Handle the migration of TXT records created before the new format (introduced in v0.12.0).
@@ -300,10 +302,10 @@ func (im *TXTRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, error
 // depending on the newFormatOnly configuration. The old format is maintained for backwards
 // compatibility but can be disabled to reduce the number of DNS records.
 func (im *TXTRegistry) generateTXTRecord(r *endpoint.Endpoint) []*endpoint.Endpoint {
-	return im.generateTXTRecordWithFilter(r, func(_ *endpoint.Endpoint) bool { return true })
+	return im.generateTXTRecordWithFilter(r, func(_, _ *endpoint.Endpoint) bool { return true })
 }
 
-func (im *TXTRegistry) generateTXTRecordWithFilter(r *endpoint.Endpoint, filter func(*endpoint.Endpoint) bool) []*endpoint.Endpoint {
+func (im *TXTRegistry) generateTXTRecordWithFilter(r *endpoint.Endpoint, filter func(*endpoint.Endpoint, *endpoint.Endpoint) bool) []*endpoint.Endpoint {
 	endpoints := make([]*endpoint.Endpoint, 0)
 
 	// Always create new format record
@@ -322,7 +324,7 @@ func (im *TXTRegistry) generateTXTRecordWithFilter(r *endpoint.Endpoint, filter 
 		txtNew.WithSetIdentifier(r.SetIdentifier)
 		txtNew.Labels[endpoint.OwnedRecordLabelKey] = r.DNSName
 		txtNew.ProviderSpecific = r.ProviderSpecific
-		if filter(txtNew) {
+		if filter(txtNew, r) {
 			endpoints = append(endpoints, txtNew)
 		}
 	}
@@ -345,7 +347,22 @@ func (im *TXTRegistry) ApplyChanges(ctx context.Context, changes *plan.Changes) 
 		}
 		r.Labels[endpoint.OwnerLabelKey] = im.ownerID
 
-		filteredChanges.Create = append(filteredChanges.Create, im.generateTXTRecordWithFilter(r, im.existingTXTs.isAbsent)...)
+		filteredChanges.Create = append(filteredChanges.Create, im.generateTXTRecordWithFilter(r, func(owner, target *endpoint.Endpoint) bool {
+			if im.existingRecords.isAbsent(owner) {
+				return true
+			}
+			// The TXT record already exists. Normally we skip re-creating it to avoid "record already
+			// exists" errors. However, when migrating between source types (e.g. Ingress → HTTPRoute,
+			// see issue #6368), the resource label embedded in the TXT value changes. If the actual
+			// record's labels differ from the current state, the TXT must also be recreated to reflect
+			// the new ownership metadata.
+			if existingRecord, exists := im.existingRecords.get(target); exists {
+				return !maps.Equal(existingRecord.Labels, target.Labels)
+			}
+			// The TXT record already exists (isAbsent returned false above), so creating it again would
+			// cause a "record already exists" error. Skip it even if the target record is absent.
+			return false
+		})...)
 
 		if im.cacheInterval > 0 {
 			im.addToCache(r)
