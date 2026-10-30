@@ -341,6 +341,7 @@ Specifies where to get the domain for a `Route` resource. This annotation should
 If the value is `defined-hosts-only`, use only the domains from the `Route` spec.
 
 If the value is `annotation-only`, use only the domains from the `Route` annotations.
+These domains are not matched against the `Gateway` listener hostnames.
 
 If the annotation is not present, use the domains from both the spec and annotations.
 

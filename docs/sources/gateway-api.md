@@ -182,6 +182,12 @@ spec:
 
 In this example, External DNS will create DNS records only for `company.private.example.com` based on the annotation, ignoring the `hostnames` field in the `HTTPRoute` spec. This prevents conflicts with existing CNAME records while enabling public resolution for specific endpoints.
 
+The annotation hostnames are not matched against the Gateway listener hostnames, since they are not the hostnames
+the Gateway routes. They are published as written (lowercased; invalid names are dropped) and point at the addresses of
+every Gateway that has accepted the Route. For example, `company.private.example.com` is published even when the
+listener only accepts `company.public.example.com`, and a wildcard annotation such as `*.example.com` is not narrowed
+to the listener hostname.
+
 For a complete list of supported annotations, see the
 [annotations documentation](../annotations/annotations.md#gateway-api-annotation-placement).
 
